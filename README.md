@@ -41,3 +41,29 @@ https://你的域名/?ed=2560&proxyip=socks5://user:pass@host:port
 设置环境变量 UUID（可选，不设置则使用默认值）
 
 这样你就可以随时通过修改URL参数来使用不同的SOCKS5代理了！
+
+
+
+
+
+---------------------------------------------------------------
+将这个 PHP 文件保存为 subscription.php，上传到：
+/usr/home/hbppp/domains/hbppp.serv00.net/public_html/
+2️⃣ 设置权限
+bashchmod 644 subscription.php
+chmod 666 subscription_cache.txt  # 如果需要缓存功能
+```
+
+### 3️⃣ **访问订阅**
+```
+https://hbppp.serv00.net/subscription.php
+✨ 功能特点：
+
+✅ 自动缓存 - 同一天内只抓取一次，减少服务器压力
+✅ 去除节点名称 - 自动清理 "(mibei77.com 米贝节点分享)"
+✅ 支持多协议 - vmess, trojan, vless, ss 等
+✅ 错误处理 - 抓取失败时返回友好错误信息
+✅ 双重抓取 - curl 优先，失败时使用 file_get_contents
+
+🎯 与 Node.js 版本功能完全相同！
+这个 PHP 版本可以直接在 serv00.net 上运行，不需要监听端口！
