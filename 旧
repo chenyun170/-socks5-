@@ -1,0 +1,1078 @@
+let userID = 'ffffffff-ffff-ffff-ffff-ffffffffffff';
+
+import { connect } from 'cloudflare:sockets';
+
+// WebSocket 状态常量
+const WS_READY_STATE_OPEN = 1;
+const WS_READY_STATE_CLOSING = 2;
+
+// 默认NAT64服务器配置
+const DEFAULT_NAT64_SERVERS = [
+  { name: 'CloudFlare', prefix: '2001:67c:2960:6464', timeout: 5000 },
+  { name: 'OpenDNS', prefix: '64:ff9b', timeout: 5000 },
+  { name: 'DNS64.DNS.SB', prefix: '2001:67c:27e4:15::64', timeout: 5000 },
+  { name: 'Google', prefix: '2001:4860:4860::6464', timeout: 5000 },
+  { name: 'UltraTools', prefix: '2001:67c:2b0::4', timeout: 5000 }
+];
+
+// 默认SOCKS5配置
+const DEFAULT_SOCKS5_CONFIG = {
+  host: '147.28.223.164',
+  port: 1080,
+  username: 'test123',
+  password: 'test123',
+  timeout: 10000,
+  enabled: true
+};
+
+// 全局配置对象
+let RUNTIME_CONFIG = {
+  socks5: {},
+  nat64Servers: [],
+  userID: '',
+  dnsServer: 'https://1.1.1.1/dns-query'
+};
+
+// 从KV存储加载配置
+async function loadConfigFromKV(env) {
+  const safeEnv = env || {};
+  
+  // 优先从环境变量读取UUID
+  RUNTIME_CONFIG.userID = safeEnv.UUID || userID;
+  userID = RUNTIME_CONFIG.userID;
+
+  // 尝试从KV读取SOCKS5配置
+  if (safeEnv.CONFIG_KV) {
+    try {
+      const savedConfig = await safeEnv.CONFIG_KV.get('socks5_config', 'json');
+      if (savedConfig) {
+        RUNTIME_CONFIG.socks5 = savedConfig;
+        console.log('从KV加载SOCKS5配置成功');
+      } else {
+        // KV中没有配置，使用默认值
+        RUNTIME_CONFIG.socks5 = { ...DEFAULT_SOCKS5_CONFIG };
+      }
+    } catch (e) {
+      console.error('从KV加载配置失败:', e);
+      RUNTIME_CONFIG.socks5 = { ...DEFAULT_SOCKS5_CONFIG };
+    }
+  } else {
+    // 没有KV绑定，从环境变量读取或使用默认值
+    RUNTIME_CONFIG.socks5 = {
+      host: safeEnv.SOCKS5_HOST || DEFAULT_SOCKS5_CONFIG.host,
+      port: parseInt(safeEnv.SOCKS5_PORT || DEFAULT_SOCKS5_CONFIG.port),
+      username: safeEnv.SOCKS5_USERNAME || DEFAULT_SOCKS5_CONFIG.username,
+      password: safeEnv.SOCKS5_PASSWORD || DEFAULT_SOCKS5_CONFIG.password,
+      timeout: parseInt(safeEnv.SOCKS5_TIMEOUT || DEFAULT_SOCKS5_CONFIG.timeout),
+      enabled: (safeEnv.SOCKS5_ENABLED || 'true').toLowerCase() === 'true'
+    };
+  }
+
+  RUNTIME_CONFIG.dnsServer = safeEnv.DNS_SERVER || RUNTIME_CONFIG.dnsServer;
+  RUNTIME_CONFIG.nat64Servers = [...DEFAULT_NAT64_SERVERS];
+}
+
+// 保存配置到KV
+async function saveConfigToKV(env, config) {
+  if (env && env.CONFIG_KV) {
+    try {
+      await env.CONFIG_KV.put('socks5_config', JSON.stringify(config));
+      console.log('配置已保存到KV');
+      return true;
+    } catch (e) {
+      console.error('保存配置到KV失败:', e);
+      return false;
+    }
+  }
+  return false;
+}
+
+// NAT64服务器健康状态管理
+class NAT64Manager {
+  constructor(servers) {
+    this.servers = [...servers];
+    this.healthStatus = new Map();
+    this.lastHealthCheck = new Map();
+    this.currentIndex = 0;
+    
+    this.servers.forEach((server, index) => {
+      this.healthStatus.set(index, true);
+      this.lastHealthCheck.set(index, 0);
+    });
+  }
+
+  updateServers(servers) {
+    this.servers = [...servers];
+    this.healthStatus.clear();
+    this.lastHealthCheck.clear();
+    this.servers.forEach((server, index) => {
+      this.healthStatus.set(index, true);
+      this.lastHealthCheck.set(index, 0);
+    });
+    this.currentIndex = 0;
+  }
+
+  getNextServer() {
+    const now = Date.now();
+    
+    for (let i = 0; i < this.servers.length; i++) {
+      const index = (this.currentIndex + i) % this.servers.length;
+      const lastCheck = this.lastHealthCheck.get(index);
+      
+      if (now - lastCheck > 60000 || this.healthStatus.get(index)) {
+        this.currentIndex = index;
+        return { ...this.servers[index], index: index };
+      }
+    }
+    
+    this.currentIndex = 0;
+    return { ...this.servers[0], index: 0 };
+  }
+
+  markServerUnhealthy(index) {
+    this.healthStatus.set(index, false);
+    this.lastHealthCheck.set(index, Date.now());
+  }
+
+  markServerHealthy(index) {
+    this.healthStatus.set(index, true);
+    this.lastHealthCheck.set(index, Date.now());
+  }
+
+  getStatus() {
+    return this.servers.map((server, index) => ({
+      name: server.name,
+      prefix: server.prefix,
+      healthy: this.healthStatus.get(index),
+      lastCheck: this.lastHealthCheck.get(index)
+    }));
+  }
+}
+
+let nat64Manager = new NAT64Manager(DEFAULT_NAT64_SERVERS);
+
+// 生成管理网页HTML
+function generateWebPage(host, hasKV) {
+  const vlessLink = `vless://${RUNTIME_CONFIG.userID}@${host}:443?encryption=none&security=tls&sni=${host}&type=ws&host=${host}&path=/#${host}`;
+  
+  return `<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>VLESS配置管理</title>
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            min-height: 100vh;
+            padding: 20px;
+        }
+        .container {
+            max-width: 900px;
+            margin: 0 auto;
+        }
+        .card {
+            background: white;
+            border-radius: 12px;
+            padding: 30px;
+            margin-bottom: 20px;
+            box-shadow: 0 10px 30px rgba(0,0,0,0.2);
+        }
+        h1 {
+            color: #667eea;
+            margin-bottom: 10px;
+            font-size: 28px;
+        }
+        h2 {
+            color: #333;
+            margin-bottom: 20px;
+            font-size: 20px;
+            border-bottom: 2px solid #667eea;
+            padding-bottom: 10px;
+        }
+        .subtitle {
+            color: #666;
+            margin-bottom: 30px;
+        }
+        .vless-section {
+            background: #f8f9fa;
+            padding: 20px;
+            border-radius: 8px;
+            margin-bottom: 20px;
+        }
+        .vless-link {
+            word-break: break-all;
+            background: white;
+            padding: 15px;
+            border-radius: 6px;
+            border: 1px solid #ddd;
+            font-family: monospace;
+            font-size: 13px;
+            color: #333;
+            margin-top: 10px;
+        }
+        .copy-btn, .save-btn {
+            background: #667eea;
+            color: white;
+            border: none;
+            padding: 10px 20px;
+            border-radius: 6px;
+            cursor: pointer;
+            margin-top: 10px;
+            font-size: 14px;
+            transition: all 0.3s;
+        }
+        .copy-btn:hover, .save-btn:hover {
+            background: #5568d3;
+            transform: translateY(-2px);
+        }
+        .save-btn {
+            background: #28a745;
+            width: 100%;
+            padding: 12px 30px;
+            font-size: 16px;
+            font-weight: 500;
+        }
+        .save-btn:hover {
+            background: #218838;
+        }
+        .save-btn:disabled {
+            background: #6c757d;
+            cursor: not-allowed;
+            transform: none;
+        }
+        .form-group {
+            margin-bottom: 20px;
+        }
+        label {
+            display: block;
+            margin-bottom: 8px;
+            color: #333;
+            font-weight: 500;
+        }
+        input[type="text"],
+        input[type="number"],
+        input[type="password"] {
+            width: 100%;
+            padding: 12px;
+            border: 1px solid #ddd;
+            border-radius: 6px;
+            font-size: 14px;
+            transition: border-color 0.3s;
+        }
+        input:focus {
+            outline: none;
+            border-color: #667eea;
+        }
+        .checkbox-group {
+            display: flex;
+            align-items: center;
+            margin-bottom: 20px;
+        }
+        .checkbox-group input[type="checkbox"] {
+            width: 20px;
+            height: 20px;
+            margin-right: 10px;
+            cursor: pointer;
+        }
+        .status-badge {
+            display: inline-block;
+            padding: 4px 12px;
+            border-radius: 12px;
+            font-size: 12px;
+            font-weight: 500;
+        }
+        .status-enabled {
+            background: #d4edda;
+            color: #155724;
+        }
+        .status-disabled {
+            background: #f8d7da;
+            color: #721c24;
+        }
+        .info-text {
+            color: #666;
+            font-size: 13px;
+            margin-top: 5px;
+        }
+        .alert {
+            padding: 15px;
+            border-radius: 6px;
+            margin-bottom: 20px;
+        }
+        .alert-warning {
+            background: #fff3cd;
+            border: 1px solid #ffc107;
+            color: #856404;
+        }
+        .alert-success {
+            background: #d4edda;
+            border: 1px solid #28a745;
+            color: #155724;
+        }
+        .alert-info {
+            background: #d1ecf1;
+            border: 1px solid #17a2b8;
+            color: #0c5460;
+        }
+        .grid {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 15px;
+        }
+        .message {
+            padding: 10px;
+            border-radius: 6px;
+            margin-top: 10px;
+            display: none;
+        }
+        .message.success {
+            background: #d4edda;
+            color: #155724;
+            border: 1px solid #c3e6cb;
+        }
+        .message.error {
+            background: #f8d7da;
+            color: #721c24;
+            border: 1px solid #f5c6cb;
+        }
+        @media (max-width: 768px) {
+            .grid {
+                grid-template-columns: 1fr;
+            }
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <div class="card">
+            <h1>🚀 VLESS代理配置管理</h1>
+            <p class="subtitle">实时管理您的VLESS链接和SOCKS5代理设置</p>
+            
+            ${!hasKV ? `
+            <div class="alert alert-warning">
+                ⚠️ <strong>未绑定KV存储</strong><br>
+                当前使用环境变量配置。要启用实时配置功能，请：<br>
+                1. 在Cloudflare创建一个KV命名空间<br>
+                2. 在Worker设置中绑定KV，变量名设为 <code>CONFIG_KV</code><br>
+                3. 重新部署后即可实时保存配置
+            </div>
+            ` : `
+            <div class="alert alert-success">
+                ✅ <strong>KV存储已启用</strong> - 配置修改会立即生效，无需重新部署
+            </div>
+            `}
+
+            <h2>📡 VLESS连接配置</h2>
+            <div class="vless-section">
+                <strong>当前UUID:</strong> <code>${RUNTIME_CONFIG.userID}</code>
+                <div class="vless-link">${vlessLink}</div>
+                <button class="copy-btn" onclick="copyVlessLink()">📋 复制VLESS链接</button>
+            </div>
+
+            <h2>🔐 SOCKS5代理配置</h2>
+            <form id="socks5Form" onsubmit="return false;">
+                <div class="checkbox-group">
+                    <input type="checkbox" id="enabled" ${RUNTIME_CONFIG.socks5.enabled ? 'checked' : ''}>
+                    <label for="enabled">启用SOCKS5代理</label>
+                    <span class="status-badge ${RUNTIME_CONFIG.socks5.enabled ? 'status-enabled' : 'status-disabled'}">
+                        ${RUNTIME_CONFIG.socks5.enabled ? '已启用' : '已禁用'}
+                    </span>
+                </div>
+
+                <div class="grid">
+                    <div class="form-group">
+                        <label for="host">SOCKS5服务器地址</label>
+                        <input type="text" id="host" value="${RUNTIME_CONFIG.socks5.host}" required>
+                    </div>
+                    <div class="form-group">
+                        <label for="port">端口</label>
+                        <input type="number" id="port" value="${RUNTIME_CONFIG.socks5.port}" required>
+                    </div>
+                </div>
+
+                <div class="grid">
+                    <div class="form-group">
+                        <label for="username">用户名</label>
+                        <input type="text" id="username" value="${RUNTIME_CONFIG.socks5.username}" required>
+                    </div>
+                    <div class="form-group">
+                        <label for="password">密码</label>
+                        <input type="password" id="password" value="${RUNTIME_CONFIG.socks5.password}" required>
+                    </div>
+                </div>
+
+                <div class="form-group">
+                    <label for="timeout">连接超时(毫秒)</label>
+                    <input type="number" id="timeout" value="${RUNTIME_CONFIG.socks5.timeout}" required>
+                    <p class="info-text">建议设置为5000-15000毫秒</p>
+                </div>
+
+                <button type="button" class="save-btn" onclick="saveConfig()" ${!hasKV ? 'disabled' : ''}>
+                    ${hasKV ? '💾 立即保存配置' : '❌ 需要绑定KV存储'}
+                </button>
+                <div id="saveMessage" class="message"></div>
+            </form>
+        </div>
+
+        <div class="card">
+            <h2>📊 当前配置状态</h2>
+            <div class="vless-section">
+                <p><strong>SOCKS5状态:</strong> <span class="status-badge ${RUNTIME_CONFIG.socks5.enabled ? 'status-enabled' : 'status-disabled'}">${RUNTIME_CONFIG.socks5.enabled ? '启用' : '禁用'}</span></p>
+                <p><strong>SOCKS5服务器:</strong> ${RUNTIME_CONFIG.socks5.host}:${RUNTIME_CONFIG.socks5.port}</p>
+                <p><strong>NAT64服务器数量:</strong> ${RUNTIME_CONFIG.nat64Servers.length}个</p>
+                <p><strong>DNS服务器:</strong> ${RUNTIME_CONFIG.dnsServer}</p>
+                <p><strong>配置存储:</strong> ${hasKV ? 'KV存储（实时生效）' : '环境变量（需重启）'}</p>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        const vlessLink = ${JSON.stringify(vlessLink)};
+        const hasKV = ${hasKV};
+        
+        function copyVlessLink() {
+            navigator.clipboard.writeText(vlessLink).then(() => {
+                alert('✅ VLESS链接已复制到剪贴板！');
+            }).catch(() => {
+                alert('❌ 复制失败，请手动复制');
+            });
+        }
+
+        async function saveConfig() {
+            if (!hasKV) {
+                alert('❌ 未绑定KV存储，无法保存配置');
+                return;
+            }
+
+            const saveBtn = document.querySelector('.save-btn');
+            const message = document.getElementById('saveMessage');
+            
+            saveBtn.disabled = true;
+            saveBtn.textContent = '⏳ 保存中...';
+            message.style.display = 'none';
+
+            const config = {
+                enabled: document.getElementById('enabled').checked,
+                host: document.getElementById('host').value,
+                port: parseInt(document.getElementById('port').value),
+                username: document.getElementById('username').value,
+                password: document.getElementById('password').value,
+                timeout: parseInt(document.getElementById('timeout').value)
+            };
+
+            try {
+                const response = await fetch('/api/save-config', {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json'
+                    },
+                    body: JSON.stringify(config)
+                });
+
+                const result = await response.json();
+
+                if (result.success) {
+                    message.className = 'message success';
+                    message.textContent = '✅ 配置保存成功！新配置已立即生效';
+                    message.style.display = 'block';
+                    
+                    // 3秒后刷新页面以显示新配置
+                    setTimeout(() => {
+                        location.reload();
+                    }, 2000);
+                } else {
+                    throw new Error(result.error || '保存失败');
+                }
+            } catch (error) {
+                message.className = 'message error';
+                message.textContent = '❌ 保存失败: ' + error.message;
+                message.style.display = 'block';
+            } finally {
+                saveBtn.disabled = false;
+                saveBtn.textContent = '💾 立即保存配置';
+            }
+        }
+
+        // 监听启用状态变化，更新状态徽章
+        document.getElementById('enabled').addEventListener('change', function() {
+            const badge = document.querySelector('.checkbox-group .status-badge');
+            if (this.checked) {
+                badge.className = 'status-badge status-enabled';
+                badge.textContent = '已启用';
+            } else {
+                badge.className = 'status-badge status-disabled';
+                badge.textContent = '已禁用';
+            }
+        });
+    </script>
+</body>
+</html>`;
+}
+
+export default {
+  async fetch(request, env, ctx) {
+    try {
+      await loadConfigFromKV(env);
+      nat64Manager.updateServers(RUNTIME_CONFIG.nat64Servers);
+      
+      const upgradeHeader = request.headers.get('Upgrade');
+      if (!upgradeHeader || upgradeHeader.toLowerCase() !== 'websocket') {
+        const url = new URL(request.url);
+        
+        // 显示管理网页
+        if (url.pathname === '/' || url.pathname === '/admin') {
+          const host = request.headers.get('Host');
+          const hasKV = !!(env && env.CONFIG_KV);
+          return new Response(generateWebPage(host, hasKV), {
+            status: 200,
+            headers: { 'Content-Type': 'text/html;charset=utf-8' },
+          });
+        }
+        
+        // API: 保存配置
+        if (url.pathname === '/api/save-config' && request.method === 'POST') {
+          if (!env || !env.CONFIG_KV) {
+            return new Response(JSON.stringify({
+              success: false,
+              error: '未绑定KV存储'
+            }), {
+              status: 400,
+              headers: { 'Content-Type': 'application/json' }
+            });
+          }
+
+          try {
+            const newConfig = await request.json();
+            
+            // 验证配置
+            if (!newConfig.host || !newConfig.port || !newConfig.username || !newConfig.password) {
+              throw new Error('配置信息不完整');
+            }
+
+            // 保存到KV
+            const saved = await saveConfigToKV(env, newConfig);
+            
+            if (saved) {
+              // 更新运行时配置
+              RUNTIME_CONFIG.socks5 = newConfig;
+              
+              return new Response(JSON.stringify({
+                success: true,
+                message: '配置保存成功'
+              }), {
+                status: 200,
+                headers: { 'Content-Type': 'application/json' }
+              });
+            } else {
+              throw new Error('保存到KV失败');
+            }
+          } catch (error) {
+            return new Response(JSON.stringify({
+              success: false,
+              error: error.message
+            }), {
+              status: 500,
+              headers: { 'Content-Type': 'application/json' }
+            });
+          }
+        }
+        
+        // API: 获取当前配置
+        if (url.pathname === '/api/config') {
+          return new Response(JSON.stringify({
+            uuid: RUNTIME_CONFIG.userID,
+            socks5: RUNTIME_CONFIG.socks5,
+            nat64Servers: RUNTIME_CONFIG.nat64Servers,
+            dnsServer: RUNTIME_CONFIG.dnsServer
+          }, null, 2), {
+            status: 200,
+            headers: { 'Content-Type': 'application/json' },
+          });
+        }
+        
+        // 状态查询
+        if (url.pathname === '/status') {
+          const status = {
+            configuration: {
+              uuid: RUNTIME_CONFIG.userID.substring(0, 8) + '***',
+              socks5: {
+                host: RUNTIME_CONFIG.socks5.host,
+                port: RUNTIME_CONFIG.socks5.port,
+                enabled: RUNTIME_CONFIG.socks5.enabled,
+                timeout: RUNTIME_CONFIG.socks5.timeout
+              },
+              dns_server: RUNTIME_CONFIG.dnsServer
+            },
+            nat64_servers: nat64Manager.getStatus()
+          };
+          return new Response(JSON.stringify(status, null, 2), {
+            status: 200,
+            headers: { 'Content-Type': 'application/json' },
+          });
+        }
+        
+        // UUID路径返回VLESS链接
+        if (url.pathname === `/${RUNTIME_CONFIG.userID}`) {
+          const host = request.headers.get('Host');
+          const vlessConfig = `vless://${RUNTIME_CONFIG.userID}@${host}:443?encryption=none&security=tls&sni=${host}&type=ws&host=${host}&path=/#${host}`;
+          return new Response(vlessConfig, {
+            status: 200,
+            headers: { 'Content-Type': 'text/plain;charset=utf-8' },
+          });
+        }
+        
+        return new Response('Not Found', { status: 404 });
+      }
+      
+      return await handleVLESSWebSocket(request);
+    } catch (err) {
+      return new Response(err.toString(), { status: 500 });
+    }
+  },
+};
+
+// 以下保持原有的WebSocket处理函数不变
+async function handleVLESSWebSocket(request) {
+  const wsPair = new WebSocketPair();
+  const [clientWS, serverWS] = Object.values(wsPair);
+  serverWS.accept();
+
+  const earlyDataHeader = request.headers.get('sec-websocket-protocol') || '';
+  const wsReadable = createWebSocketReadableStream(serverWS, earlyDataHeader);
+  let remoteSocket = null;
+  let udpStreamWrite = null;
+  let isDns = false;
+  
+  wsReadable.pipeTo(new WritableStream({
+    async write(chunk) {
+      if (isDns && udpStreamWrite) {
+        return udpStreamWrite(chunk);
+      }
+      
+      if (remoteSocket) {
+        const writer = remoteSocket.writable.getWriter();
+        await writer.write(chunk);
+        writer.releaseLock();
+        return;
+      }
+
+      const result = parseVLESSHeader(chunk, RUNTIME_CONFIG.userID);
+      if (result.hasError) {
+        throw new Error(result.message);
+      }
+
+      const vlessRespHeader = new Uint8Array([result.vlessVersion[0], 0]);
+      const rawClientData = chunk.slice(result.rawDataIndex);
+      
+      if (result.isUDP) {
+        if (result.portRemote === 53) {
+          isDns = true;
+          const { write } = await handleUDPOutBound(serverWS, vlessRespHeader);
+          udpStreamWrite = write;
+          udpStreamWrite(rawClientData);
+          return;
+        } else {
+          throw new Error('UDP代理仅支持DNS(端口53)');
+        }
+      }
+
+      try {
+        if (RUNTIME_CONFIG.socks5.enabled) {
+          try {
+            const socks5Socket = await connectViaSocks5(result.addressRemote, result.portRemote, rawClientData);
+            remoteSocket = socks5Socket;
+            pipeRemoteToWebSocket(socks5Socket, serverWS, vlessRespHeader, null);
+            return;
+          } catch (socks5Error) {
+            console.error('SOCKS5连接失败:', socks5Error.message);
+          }
+        }
+        
+        try {
+          const tcpSocket = await tryNAT64Connect(result.addressRemote, result.portRemote, rawClientData);
+          remoteSocket = tcpSocket;
+          pipeRemoteToWebSocket(tcpSocket, serverWS, vlessRespHeader, null);
+        } catch (nat64Error) {
+          console.error('NAT64连接失败:', nat64Error.message);
+          
+          try {
+            const tcpSocket = await directConnect(result.addressRemote, result.portRemote, rawClientData);
+            remoteSocket = tcpSocket;
+            pipeRemoteToWebSocket(tcpSocket, serverWS, vlessRespHeader, null);
+          } catch (directError) {
+            console.error('直接连接失败:', directError.message);
+            serverWS.close(1011, '所有连接方式都失败');
+          }
+        }
+      } catch (generalError) {
+        console.error('连接过程中出现意外错误:', generalError);
+        serverWS.close(1011, `连接失败: ${generalError.message}`);
+      }
+    },
+    close() {
+      if (remoteSocket) {
+        closeSocket(remoteSocket);
+      }
+    }
+  })).catch(err => {
+    console.error('WebSocket 错误:', err);
+    closeSocket(remoteSocket);
+    serverWS.close(1011, '内部错误');
+  });
+
+  return new Response(null, {
+    status: 101,
+    webSocket: clientWS,
+  });
+}
+
+async function connectViaSocks5(targetHost, targetPort, rawClientData) {
+  const socks5Socket = await connect({
+    hostname: RUNTIME_CONFIG.socks5.host,
+    port: RUNTIME_CONFIG.socks5.port
+  });
+
+  const writer = socks5Socket.writable.getWriter();
+  const reader = socks5Socket.readable.getReader();
+
+  try {
+    const authMethods = new Uint8Array([0x05, 0x01, 0x02]);
+    await writer.write(authMethods);
+    const authResponse = await reader.read();
+    const authData = new Uint8Array(authResponse.value);
+    
+    if (authData[0] !== 0x05 || authData[1] !== 0x02) {
+      throw new Error('SOCKS5认证方法协商失败');
+    }
+
+    const username = new TextEncoder().encode(RUNTIME_CONFIG.socks5.username);
+    const password = new TextEncoder().encode(RUNTIME_CONFIG.socks5.password);
+    const authPacket = new Uint8Array(3 + username.length + password.length);
+    
+    authPacket[0] = 0x01;
+    authPacket[1] = username.length;
+    authPacket.set(username, 2);
+    authPacket[2 + username.length] = password.length;
+    authPacket.set(password, 3 + username.length);
+    
+    await writer.write(authPacket);
+    const authResult = await reader.read();
+    const authResultData = new Uint8Array(authResult.value);
+    
+    if (authResultData.length < 2 || authResultData[1] !== 0x00) {
+      throw new Error('SOCKS5用户名密码认证失败');
+    }
+
+    const hostBytes = new TextEncoder().encode(targetHost);
+    const connectPacket = new Uint8Array(7 + hostBytes.length);
+    
+    connectPacket[0] = 0x05;
+    connectPacket[1] = 0x01;
+    connectPacket[2] = 0x00;
+    connectPacket[3] = 0x03;
+    connectPacket[4] = hostBytes.length;
+    connectPacket.set(hostBytes, 5);
+    connectPacket[5 + hostBytes.length] = (targetPort >> 8) & 0xFF;
+    connectPacket[6 + hostBytes.length] = targetPort & 0xFF;
+    
+    await writer.write(connectPacket);
+    const connectResponse = await reader.read();
+    const connectData = new Uint8Array(connectResponse.value);
+    
+    if (connectData.length < 2 || connectData[1] !== 0x00) {
+      throw new Error(`SOCKS5连接失败，错误码: ${connectData[1]}`);
+    }
+
+    reader.releaseLock();
+    writer.releaseLock();
+
+    const dataWriter = socks5Socket.writable.getWriter();
+    await dataWriter.write(rawClientData);
+    dataWriter.releaseLock();
+
+    return socks5Socket;
+  } catch (err) {
+    try {
+      reader.releaseLock();
+      writer.releaseLock();
+    } catch (e) {}
+    closeSocket(socks5Socket);
+    throw err;
+  }
+}
+
+async function tryNAT64Connect(domain, port, rawClientData) {
+  let lastError = null;
+  
+  for (let attempt = 0; attempt < RUNTIME_CONFIG.nat64Servers.length; attempt++) {
+    const nat64Server = nat64Manager.getNextServer();
+    
+    try {
+      const proxyIP = await getIPv6ProxyAddress(domain, nat64Server);
+      const connectPromise = connect({ hostname: proxyIP, port: port });
+      const timeoutPromise = new Promise((_, reject) => {
+        setTimeout(() => reject(new Error('连接超时')), nat64Server.timeout);
+      });
+      
+      const tcpSocket = await Promise.race([connectPromise, timeoutPromise]);
+      nat64Manager.markServerHealthy(nat64Server.index);
+      
+      const writer = tcpSocket.writable.getWriter();
+      await writer.write(rawClientData);
+      writer.releaseLock();
+      
+      return tcpSocket;
+    } catch (err) {
+      lastError = err;
+      nat64Manager.markServerUnhealthy(nat64Server.index);
+      
+      if (attempt < RUNTIME_CONFIG.nat64Servers.length - 1) {
+        continue;
+      }
+    }
+  }
+  
+  throw new Error(`所有NAT64服务器连接失败，最后错误: ${lastError?.message}`);
+}
+
+async function directConnect(address, port, rawClientData) {
+  const tcpSocket = await connect({ hostname: address, port: port });
+  const writer = tcpSocket.writable.getWriter();
+  await writer.write(rawClientData);
+  writer.releaseLock();
+  return tcpSocket;
+}
+
+async function getIPv6ProxyAddress(domain, nat64Server) {
+  const dnsQuery = await fetch(`${RUNTIME_CONFIG.dnsServer}?name=${domain}&type=A`, {
+    headers: { 'Accept': 'application/dns-json' }
+  });
+  
+  const dnsResult = await dnsQuery.json();
+  if (dnsResult.Answer && dnsResult.Answer.length > 0) {
+    const aRecord = dnsResult.Answer.find(record => record.type === 1);
+    if (aRecord) {
+      const ipv4Address = aRecord.data;
+      return convertToNAT64IPv6(ipv4Address, nat64Server.prefix);
+    }
+  }
+  throw new Error('无法解析域名的IPv4地址');
+}
+
+function convertToNAT64IPv6(ipv4Address, nat64Prefix) {
+  const parts = ipv4Address.split('.');
+  if (parts.length !== 4) throw new Error('无效的IPv4地址');
+  
+  const hex = parts.map(part => {
+    const num = parseInt(part, 10);
+    if (num < 0 || num > 255) throw new Error('无效的IPv4地址段');
+    return num.toString(16).padStart(2, '0');
+  });
+  
+  if (nat64Prefix === '64:ff9b') {
+    return `[64:ff9b::${hex[0]}${hex[1]}:${hex[2]}${hex[3]}]`;
+  } else if (nat64Prefix.includes('::')) {
+    return `[${nat64Prefix}:${hex[0]}${hex[1]}:${hex[2]}${hex[3]}]`;
+  } else {
+    return `[${nat64Prefix}::${hex[0]}${hex[1]}:${hex[2]}${hex[3]}]`;
+  }
+}
+
+function createWebSocketReadableStream(ws, earlyDataHeader) {
+  return new ReadableStream({
+    start(controller) {
+      ws.addEventListener('message', event => {
+        controller.enqueue(event.data);
+      });
+      
+      ws.addEventListener('close', () => {
+        controller.close();
+      });
+      
+      ws.addEventListener('error', err => {
+        controller.error(err);
+      });
+      
+      if (earlyDataHeader) {
+        try {
+          const decoded = atob(earlyDataHeader.replace(/-/g, '+').replace(/_/g, '/'));
+          const data = Uint8Array.from(decoded, c => c.charCodeAt(0));
+          controller.enqueue(data.buffer);
+        } catch (e) {}
+      }
+    }
+  });
+}
+
+function parseVLESSHeader(buffer, userID) {
+  if (buffer.byteLength < 24) {
+    return { hasError: true, message: '无效的头部长度' };
+  }
+  
+  const view = new DataView(buffer);
+  const version = new Uint8Array(buffer.slice(0, 1));
+  
+  const uuid = formatUUID(new Uint8Array(buffer.slice(1, 17)));
+  if (uuid !== userID) {
+    return { hasError: true, message: '无效的用户' };
+  }
+  
+  const optionsLength = view.getUint8(17);
+  const command = view.getUint8(18 + optionsLength);
+  
+  let isUDP = false;
+  if (command === 1) {
+  } else if (command === 2) {
+    isUDP = true;
+  } else {
+    return { hasError: true, message: '不支持的命令，仅支持TCP(01)和UDP(02)' };
+  }
+  
+  let offset = 19 + optionsLength;
+  const port = view.getUint16(offset);
+  offset += 2;
+  
+  const addressType = view.getUint8(offset++);
+  let address = '';
+  
+  switch (addressType) {
+    case 1:
+      address = Array.from(new Uint8Array(buffer.slice(offset, offset + 4))).join('.');
+      offset += 4;
+      break;
+      
+    case 2:
+      const domainLength = view.getUint8(offset++);
+      address = new TextDecoder().decode(buffer.slice(offset, offset + domainLength));
+      offset += domainLength;
+      break;
+      
+    case 3:
+      const ipv6 = [];
+      for (let i = 0; i < 8; i++) {
+        ipv6.push(view.getUint16(offset).toString(16).padStart(4, '0'));
+        offset += 2;
+      }
+      address = ipv6.join(':').replace(/(^|:)0+(\w)/g, '$1$2');
+      break;
+      
+    default:
+      return { hasError: true, message: '不支持的地址类型' };
+  }
+  
+  return {
+    hasError: false,
+    addressRemote: address,
+    portRemote: port,
+    rawDataIndex: offset,
+    vlessVersion: version,
+    isUDP
+  };
+}
+
+function pipeRemoteToWebSocket(remoteSocket, ws, vlessHeader, retry = null) {
+  let headerSent = false;
+  let hasIncomingData = false;
+  
+  remoteSocket.readable.pipeTo(new WritableStream({
+    write(chunk) {
+      hasIncomingData = true;
+      if (ws.readyState === WS_READY_STATE_OPEN) {
+        if (!headerSent) {
+          const combined = new Uint8Array(vlessHeader.byteLength + chunk.byteLength);
+          combined.set(new Uint8Array(vlessHeader), 0);
+          combined.set(new Uint8Array(chunk), vlessHeader.byteLength);
+          ws.send(combined.buffer);
+          headerSent = true;
+        } else {
+          ws.send(chunk);
+        }
+      }
+    },
+    close() {
+      if (!hasIncomingData && retry) {
+        retry();
+        return;
+      }
+      if (ws.readyState === WS_READY_STATE_OPEN) {
+        ws.close(1000, '正常关闭');
+      }
+    },
+    abort() {
+      closeSocket(remoteSocket);
+    }
+  })).catch(err => {
+    console.error('数据转发错误:', err);
+    closeSocket(remoteSocket);
+    if (ws.readyState === WS_READY_STATE_OPEN) {
+      ws.close(1011, '数据传输错误');
+    }
+  });
+}
+
+function closeSocket(socket) {
+  if (socket) {
+    try {
+      socket.close();
+    } catch (e) {}
+  }
+}
+
+function formatUUID(bytes) {
+  const hex = Array.from(bytes, b => b.toString(16).padStart(2, '0')).join('');
+  return `${hex.slice(0,8)}-${hex.slice(8,12)}-${hex.slice(12,16)}-${hex.slice(16,20)}-${hex.slice(20)}`;
+}
+
+async function handleUDPOutBound(webSocket, vlessResponseHeader) {
+  let isVlessHeaderSent = false;
+  const transformStream = new TransformStream({
+    start(controller) {},
+    transform(chunk, controller) {
+      for (let index = 0; index < chunk.byteLength;) {
+        const lengthBuffer = chunk.slice(index, index + 2);
+        const udpPacketLength = new DataView(lengthBuffer).getUint16(0);
+        const udpData = new Uint8Array(
+          chunk.slice(index + 2, index + 2 + udpPacketLength)
+        );
+        index = index + 2 + udpPacketLength;
+        controller.enqueue(udpData);
+      }
+    },
+    flush(controller) {}
+  });
+
+  transformStream.readable.pipeTo(new WritableStream({
+    async write(chunk) {
+      const resp = await fetch(RUNTIME_CONFIG.dnsServer, {
+        method: 'POST',
+        headers: { 'content-type': 'application/dns-message' },
+        body: chunk,
+      });
+      const dnsQueryResult = await resp.arrayBuffer();
+      const udpSize = dnsQueryResult.byteLength;
+      const udpSizeBuffer = new Uint8Array([(udpSize >> 8) & 0xff, udpSize & 0xff]);
+      
+      if (webSocket.readyState === WS_READY_STATE_OPEN) {
+        if (isVlessHeaderSent) {
+          webSocket.send(await new Blob([udpSizeBuffer, dnsQueryResult]).arrayBuffer());
+        } else {
+          webSocket.send(await new Blob([vlessResponseHeader, udpSizeBuffer, dnsQueryResult]).arrayBuffer());
+          isVlessHeaderSent = true;
+        }
+      }
+    }
+  })).catch((error) => {
+    console.error('DNS UDP处理错误:', error);
+  });
+
+  const writer = transformStream.writable.getWriter();
+
+  return {
+    write(chunk) {
+      writer.write(chunk);
+    }
+  };
+}
