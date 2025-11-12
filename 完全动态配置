@@ -1,0 +1,1044 @@
+let userID = 'ffffffff-ffff-ffff-ffff-ffffffffffff';
+
+import { connect } from 'cloudflare:sockets';
+
+const WS_READY_STATE_OPEN = 1;
+const WS_READY_STATE_CLOSING = 2;
+
+const DEFAULT_NAT64_SERVERS = [
+  { name: 'CloudFlare', prefix: '2001:67c:2960:6464', timeout: 5000 },
+  { name: 'OpenDNS', prefix: '64:ff9b', timeout: 5000 },
+  { name: 'DNS64.DNS.SB', prefix: '2001:67c:27e4:15::64', timeout: 5000 },
+  { name: 'Google', prefix: '2001:4860:4860::6464', timeout: 5000 },
+  { name: 'UltraTools', prefix: '2001:67c:2b0::4', timeout: 5000 }
+];
+
+let RUNTIME_CONFIG = {
+  socks5: null,  // 默认为空，通过URL参数设置
+  nat64Servers: [...DEFAULT_NAT64_SERVERS],
+  userID: '',
+  dnsServer: 'https://1.1.1.1/dns-query'
+};
+
+// 解析SOCKS代理URL
+function parseProxyURL(proxyUrl) {
+  try {
+    // 支持格式:
+    // socks://host:port
+    // socks5://host:port
+    // socks://user:password@host:port
+    // socks5://user:password@host:port
+    
+    const url = new URL(proxyUrl);
+    
+    if (!['socks:', 'socks5:'].includes(url.protocol)) {
+      throw new Error('仅支持 socks:// 或 socks5:// 协议');
+    }
+    
+    const config = {
+      host: url.hostname,
+      port: parseInt(url.port) || 1080,
+      username: url.username || '',
+      password: url.password || '',
+      timeout: 10000,
+      enabled: true
+    };
+    
+    if (!config.host) {
+      throw new Error('缺少主机地址');
+    }
+    
+    return config;
+  } catch (error) {
+    throw new Error(`代理URL解析失败: ${error.message}`);
+  }
+}
+
+// 从URL参数中提取配置
+function extractConfigFromURL(url) {
+  const params = url.searchParams;
+  const proxyip = params.get('proxyip');
+  const ed = params.get('ed');
+  
+  let socks5Config = null;
+  
+  if (proxyip) {
+    try {
+      socks5Config = parseProxyURL(proxyip);
+    } catch (error) {
+      console.error('解析proxyip失败:', error.message);
+      return { error: error.message };
+    }
+  }
+  
+  return {
+    socks5: socks5Config,
+    ed: ed
+  };
+}
+
+async function loadConfigFromKV(env) {
+  const safeEnv = env || {};
+  RUNTIME_CONFIG.userID = safeEnv.UUID || userID;
+  userID = RUNTIME_CONFIG.userID;
+  RUNTIME_CONFIG.dnsServer = safeEnv.DNS_SERVER || RUNTIME_CONFIG.dnsServer;
+}
+
+function generateWebPage(host, currentConfig) {
+  const hasConfig = currentConfig && currentConfig.socks5;
+  const error = currentConfig?.error;
+  
+  // 生成示例URL
+  const exampleUrl1 = `https://${host}/?proxyip=socks5://proxy.example.com:1080`;
+  const exampleUrl2 = `https://${host}/?proxyip=socks5://user:pass@proxy.example.com:1080`;
+  const exampleUrl3 = `https://${host}/?ed=2560&proxyip=socks5://user:pass@proxy.example.com:1080`;
+  
+  // 生成VLESS链接
+  let vlessLink = '';
+  if (hasConfig) {
+    const proxyParam = encodeURIComponent(`socks5://${currentConfig.socks5.username}:${currentConfig.socks5.password}@${currentConfig.socks5.host}:${currentConfig.socks5.port}`);
+    const path = `/?proxyip=${proxyParam}`;
+    vlessLink = `vless://${RUNTIME_CONFIG.userID}@${host}:443?encryption=none&security=tls&sni=${host}&type=ws&host=${host}&path=${encodeURIComponent(path)}#SOCKS5-${currentConfig.socks5.host}`;
+  }
+
+  return `<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>动态SOCKS5代理配置</title>
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            min-height: 100vh;
+            padding: 20px;
+        }
+        .container {
+            max-width: 1000px;
+            margin: 0 auto;
+        }
+        .card {
+            background: white;
+            border-radius: 12px;
+            padding: 30px;
+            margin-bottom: 20px;
+            box-shadow: 0 10px 30px rgba(0,0,0,0.2);
+        }
+        h1 {
+            color: #667eea;
+            margin-bottom: 10px;
+            font-size: 28px;
+        }
+        h2 {
+            color: #333;
+            margin: 20px 0 15px 0;
+            font-size: 20px;
+            border-bottom: 2px solid #667eea;
+            padding-bottom: 10px;
+        }
+        .subtitle {
+            color: #666;
+            margin-bottom: 20px;
+            line-height: 1.6;
+        }
+        .alert {
+            padding: 15px;
+            border-radius: 6px;
+            margin-bottom: 20px;
+        }
+        .alert-info {
+            background: #d1ecf1;
+            border: 1px solid #17a2b8;
+            color: #0c5460;
+        }
+        .alert-success {
+            background: #d4edda;
+            border: 1px solid #28a745;
+            color: #155724;
+        }
+        .alert-error {
+            background: #f8d7da;
+            border: 1px solid #dc3545;
+            color: #721c24;
+        }
+        .alert-warning {
+            background: #fff3cd;
+            border: 1px solid #ffc107;
+            color: #856404;
+        }
+        .example-box {
+            background: #f8f9fa;
+            padding: 20px;
+            border-radius: 8px;
+            margin: 15px 0;
+            border-left: 4px solid #667eea;
+        }
+        .code {
+            background: white;
+            padding: 12px;
+            border-radius: 6px;
+            font-family: monospace;
+            font-size: 13px;
+            word-break: break-all;
+            border: 1px solid #ddd;
+            margin: 10px 0;
+            color: #333;
+        }
+        .config-form {
+            background: #f8f9fa;
+            padding: 25px;
+            border-radius: 8px;
+            margin: 20px 0;
+        }
+        .form-group {
+            margin-bottom: 20px;
+        }
+        label {
+            display: block;
+            margin-bottom: 8px;
+            color: #333;
+            font-weight: 500;
+        }
+        input[type="text"],
+        input[type="number"],
+        input[type="password"] {
+            width: 100%;
+            padding: 12px;
+            border: 1px solid #ddd;
+            border-radius: 6px;
+            font-size: 14px;
+        }
+        input:focus {
+            outline: none;
+            border-color: #667eea;
+        }
+        .grid {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 15px;
+        }
+        .btn {
+            background: #667eea;
+            color: white;
+            border: none;
+            padding: 12px 24px;
+            border-radius: 6px;
+            cursor: pointer;
+            font-size: 14px;
+            transition: all 0.3s;
+            width: 100%;
+        }
+        .btn:hover {
+            background: #5568d3;
+            transform: translateY(-2px);
+        }
+        .copy-btn {
+            background: #28a745;
+            margin-top: 10px;
+        }
+        .copy-btn:hover {
+            background: #218838;
+        }
+        .info-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+            gap: 15px;
+            margin: 15px 0;
+        }
+        .info-item {
+            background: #f8f9fa;
+            padding: 15px;
+            border-radius: 6px;
+        }
+        .info-label {
+            color: #666;
+            font-size: 13px;
+            margin-bottom: 5px;
+        }
+        .info-value {
+            color: #333;
+            font-weight: 500;
+            font-family: monospace;
+        }
+        .status-badge {
+            display: inline-block;
+            padding: 4px 12px;
+            border-radius: 12px;
+            font-size: 12px;
+            font-weight: 500;
+        }
+        .status-active {
+            background: #d4edda;
+            color: #155724;
+        }
+        .status-inactive {
+            background: #f8d7da;
+            color: #721c24;
+        }
+        ul {
+            margin-left: 20px;
+            line-height: 1.8;
+        }
+        @media (max-width: 768px) {
+            .grid {
+                grid-template-columns: 1fr;
+            }
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <div class="card">
+            <h1>🚀 动态SOCKS5代理配置</h1>
+            <p class="subtitle">
+                通过URL参数动态设置SOCKS5代理，无需修改代码。支持随时切换不同的代理服务器。
+            </p>
+            
+            ${error ? `
+            <div class="alert alert-error">
+                <strong>❌ 配置错误:</strong> ${error}
+            </div>
+            ` : ''}
+            
+            ${!hasConfig ? `
+            <div class="alert alert-info">
+                <strong>💡 使用说明:</strong><br>
+                当前未配置SOCKS5代理。请在URL中添加 <code>proxyip</code> 参数来设置代理。
+            </div>
+            ` : `
+            <div class="alert alert-success">
+                <strong>✅ 代理已配置</strong><br>
+                当前正在使用: ${currentConfig.socks5.host}:${currentConfig.socks5.port}
+                ${currentConfig.socks5.username ? ` (认证: ${currentConfig.socks5.username})` : ' (无认证)'}
+            </div>
+            `}
+
+            <h2>📝 快速配置</h2>
+            <div class="config-form">
+                <div class="grid">
+                    <div class="form-group">
+                        <label>SOCKS5 服务器地址</label>
+                        <input type="text" id="host" placeholder="proxy.example.com" value="${hasConfig ? currentConfig.socks5.host : ''}">
+                    </div>
+                    <div class="form-group">
+                        <label>端口</label>
+                        <input type="number" id="port" placeholder="1080" value="${hasConfig ? currentConfig.socks5.port : '1080'}">
+                    </div>
+                </div>
+                <div class="grid">
+                    <div class="form-group">
+                        <label>用户名 (可选)</label>
+                        <input type="text" id="username" placeholder="留空表示无认证" value="${hasConfig ? currentConfig.socks5.username : ''}">
+                    </div>
+                    <div class="form-group">
+                        <label>密码 (可选)</label>
+                        <input type="password" id="password" placeholder="留空表示无认证" value="${hasConfig ? currentConfig.socks5.password : ''}">
+                    </div>
+                </div>
+                <button class="btn" onclick="generateURL()">🔗 生成访问链接</button>
+                <div id="generatedURL" style="display: none; margin-top: 15px;">
+                    <label>生成的URL:</label>
+                    <div class="code" id="urlOutput"></div>
+                    <button class="btn copy-btn" onclick="copyURL()">📋 复制URL</button>
+                </div>
+            </div>
+
+            ${hasConfig ? `
+            <h2>📡 VLESS配置</h2>
+            <div class="example-box">
+                <strong>当前代理的VLESS链接:</strong>
+                <div class="code">${vlessLink}</div>
+                <button class="btn copy-btn" onclick="copyVlessLink()">📋 复制VLESS链接</button>
+            </div>
+            ` : ''}
+
+            <h2>📖 支持的URL格式</h2>
+            <div class="example-box">
+                <strong>1️⃣ 无认证代理:</strong>
+                <div class="code">${exampleUrl1}</div>
+            </div>
+            
+            <div class="example-box">
+                <strong>2️⃣ 带认证的代理:</strong>
+                <div class="code">${exampleUrl2}</div>
+            </div>
+            
+            <div class="example-box">
+                <strong>3️⃣ 包含额外参数 (ed):</strong>
+                <div class="code">${exampleUrl3}</div>
+            </div>
+
+            <h2>🔧 支持的协议</h2>
+            <div class="alert alert-warning">
+                <ul>
+                    <li><code>socks://</code> - SOCKS5协议 (简写)</li>
+                    <li><code>socks5://</code> - SOCKS5协议 (标准)</li>
+                    <li>格式1: <code>socks5://host:port</code> (无认证)</li>
+                    <li>格式2: <code>socks5://user:pass@host:port</code> (带认证)</li>
+                </ul>
+            </div>
+        </div>
+
+        <div class="card">
+            <h2>📊 当前状态</h2>
+            <div class="info-grid">
+                <div class="info-item">
+                    <div class="info-label">UUID</div>
+                    <div class="info-value">${RUNTIME_CONFIG.userID.substring(0, 8)}***</div>
+                </div>
+                <div class="info-item">
+                    <div class="info-label">SOCKS5状态</div>
+                    <div class="info-value">
+                        <span class="status-badge ${hasConfig ? 'status-active' : 'status-inactive'}">
+                            ${hasConfig ? '✅ 已配置' : '❌ 未配置'}
+                        </span>
+                    </div>
+                </div>
+                ${hasConfig ? `
+                <div class="info-item">
+                    <div class="info-label">代理服务器</div>
+                    <div class="info-value">${currentConfig.socks5.host}:${currentConfig.socks5.port}</div>
+                </div>
+                <div class="info-item">
+                    <div class="info-label">认证方式</div>
+                    <div class="info-value">${currentConfig.socks5.username ? '✅ 用户名密码' : '⭕ 无认证'}</div>
+                </div>
+                ` : ''}
+                <div class="info-item">
+                    <div class="info-label">NAT64服务器</div>
+                    <div class="info-value">${RUNTIME_CONFIG.nat64Servers.length} 个</div>
+                </div>
+                <div class="info-item">
+                    <div class="info-label">DNS服务器</div>
+                    <div class="info-value">${RUNTIME_CONFIG.dnsServer}</div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        const vlessLink = ${hasConfig ? JSON.stringify(vlessLink) : 'null'};
+        const currentHost = '${host}';
+        
+        function generateURL() {
+            const host = document.getElementById('host').value.trim();
+            const port = document.getElementById('port').value.trim();
+            const username = document.getElementById('username').value.trim();
+            const password = document.getElementById('password').value.trim();
+            
+            if (!host) {
+                alert('❌ 请输入SOCKS5服务器地址');
+                return;
+            }
+            
+            let proxyUrl;
+            if (username && password) {
+                proxyUrl = \`socks5://\${encodeURIComponent(username)}:\${encodeURIComponent(password)}@\${host}:\${port || '1080'}\`;
+            } else {
+                proxyUrl = \`socks5://\${host}:\${port || '1080'}\`;
+            }
+            
+            const fullUrl = \`https://\${currentHost}/?proxyip=\${encodeURIComponent(proxyUrl)}\`;
+            
+            document.getElementById('urlOutput').textContent = fullUrl;
+            document.getElementById('generatedURL').style.display = 'block';
+            
+            window.generatedUrl = fullUrl;
+        }
+        
+        function copyURL() {
+            if (window.generatedUrl) {
+                navigator.clipboard.writeText(window.generatedUrl).then(() => {
+                    alert('✅ URL已复制到剪贴板！');
+                }).catch(() => {
+                    alert('❌ 复制失败，请手动复制');
+                });
+            }
+        }
+        
+        function copyVlessLink() {
+            if (vlessLink) {
+                navigator.clipboard.writeText(vlessLink).then(() => {
+                    alert('✅ VLESS链接已复制到剪贴板！');
+                }).catch(() => {
+                    alert('❌ 复制失败，请手动复制');
+                });
+            }
+        }
+    </script>
+</body>
+</html>`;
+}
+
+class NAT64Manager {
+  constructor(servers) {
+    this.servers = [...servers];
+    this.healthStatus = new Map();
+    this.lastHealthCheck = new Map();
+    this.currentIndex = 0;
+    this.servers.forEach((server, index) => {
+      this.healthStatus.set(index, true);
+      this.lastHealthCheck.set(index, 0);
+    });
+  }
+
+  getNextServer() {
+    const now = Date.now();
+    for (let i = 0; i < this.servers.length; i++) {
+      const index = (this.currentIndex + i) % this.servers.length;
+      const lastCheck = this.lastHealthCheck.get(index);
+      if (now - lastCheck > 60000 || this.healthStatus.get(index)) {
+        this.currentIndex = index;
+        return { ...this.servers[index], index: index };
+      }
+    }
+    this.currentIndex = 0;
+    return { ...this.servers[0], index: 0 };
+  }
+
+  markServerUnhealthy(index) {
+    this.healthStatus.set(index, false);
+    this.lastHealthCheck.set(index, Date.now());
+  }
+
+  markServerHealthy(index) {
+    this.healthStatus.set(index, true);
+    this.lastHealthCheck.set(index, Date.now());
+  }
+}
+
+let nat64Manager = new NAT64Manager(DEFAULT_NAT64_SERVERS);
+
+export default {
+  async fetch(request, env, ctx) {
+    try {
+      await loadConfigFromKV(env);
+      
+      const url = new URL(request.url);
+      const upgradeHeader = request.headers.get('Upgrade');
+      
+      // 从URL参数中提取配置
+      const urlConfig = extractConfigFromURL(url);
+      
+      if (!upgradeHeader || upgradeHeader.toLowerCase() !== 'websocket') {
+        // 显示管理页面
+        if (url.pathname === '/' || url.pathname === '/admin') {
+          const host = request.headers.get('Host');
+          return new Response(generateWebPage(host, urlConfig), {
+            status: 200,
+            headers: { 'Content-Type': 'text/html;charset=utf-8' },
+          });
+        }
+        
+        // API: 获取当前配置
+        if (url.pathname === '/api/config') {
+          return new Response(JSON.stringify({
+            uuid: RUNTIME_CONFIG.userID,
+            socks5: urlConfig.socks5,
+            nat64Servers: RUNTIME_CONFIG.nat64Servers,
+            dnsServer: RUNTIME_CONFIG.dnsServer
+          }, null, 2), {
+            status: 200,
+            headers: { 'Content-Type': 'application/json' },
+          });
+        }
+        
+        // 状态查询
+        if (url.pathname === '/status') {
+          const status = {
+            uuid: RUNTIME_CONFIG.userID.substring(0, 8) + '***',
+            socks5_configured: !!urlConfig.socks5,
+            socks5_info: urlConfig.socks5 ? {
+              host: urlConfig.socks5.host,
+              port: urlConfig.socks5.port,
+              has_auth: !!(urlConfig.socks5.username && urlConfig.socks5.password)
+            } : null,
+            nat64_servers: nat64Manager.servers.length,
+            dns_server: RUNTIME_CONFIG.dnsServer
+          };
+          return new Response(JSON.stringify(status, null, 2), {
+            status: 200,
+            headers: { 'Content-Type': 'application/json' },
+          });
+        }
+        
+        return new Response('Not Found', { status: 404 });
+      }
+      
+      // WebSocket连接 - 应用URL参数中的配置
+      if (urlConfig.error) {
+        return new Response(urlConfig.error, { status: 400 });
+      }
+      
+      RUNTIME_CONFIG.socks5 = urlConfig.socks5;
+      
+      return await handleVLESSWebSocket(request);
+    } catch (err) {
+      return new Response(err.toString(), { status: 500 });
+    }
+  },
+};
+
+async function handleVLESSWebSocket(request) {
+  const wsPair = new WebSocketPair();
+  const [clientWS, serverWS] = Object.values(wsPair);
+  serverWS.accept();
+
+  const earlyDataHeader = request.headers.get('sec-websocket-protocol') || '';
+  const wsReadable = createWebSocketReadableStream(serverWS, earlyDataHeader);
+  let remoteSocket = null;
+  let udpStreamWrite = null;
+  let isDns = false;
+  
+  wsReadable.pipeTo(new WritableStream({
+    async write(chunk) {
+      if (isDns && udpStreamWrite) {
+        return udpStreamWrite(chunk);
+      }
+      
+      if (remoteSocket) {
+        const writer = remoteSocket.writable.getWriter();
+        await writer.write(chunk);
+        writer.releaseLock();
+        return;
+      }
+
+      const result = parseVLESSHeader(chunk, RUNTIME_CONFIG.userID);
+      if (result.hasError) {
+        throw new Error(result.message);
+      }
+
+      const vlessRespHeader = new Uint8Array([result.vlessVersion[0], 0]);
+      const rawClientData = chunk.slice(result.rawDataIndex);
+      
+      if (result.isUDP) {
+        if (result.portRemote === 53) {
+          isDns = true;
+          const { write } = await handleUDPOutBound(serverWS, vlessRespHeader);
+          udpStreamWrite = write;
+          udpStreamWrite(rawClientData);
+          return;
+        } else {
+          throw new Error('UDP代理仅支持DNS(端口53)');
+        }
+      }
+
+      try {
+        // 如果配置了SOCKS5，优先使用
+        if (RUNTIME_CONFIG.socks5 && RUNTIME_CONFIG.socks5.enabled) {
+          try {
+            const socks5Socket = await connectViaSocks5(result.addressRemote, result.portRemote, rawClientData);
+            remoteSocket = socks5Socket;
+            pipeRemoteToWebSocket(socks5Socket, serverWS, vlessRespHeader, null);
+            return;
+          } catch (socks5Error) {
+            console.error('SOCKS5连接失败:', socks5Error.message);
+          }
+        }
+        
+        // SOCKS5失败或未配置，尝试NAT64
+        try {
+          const tcpSocket = await tryNAT64Connect(result.addressRemote, result.portRemote, rawClientData);
+          remoteSocket = tcpSocket;
+          pipeRemoteToWebSocket(tcpSocket, serverWS, vlessRespHeader, null);
+        } catch (nat64Error) {
+          console.error('NAT64连接失败:', nat64Error.message);
+          
+          // 最后尝试直接连接
+          try {
+            const tcpSocket = await directConnect(result.addressRemote, result.portRemote, rawClientData);
+            remoteSocket = tcpSocket;
+            pipeRemoteToWebSocket(tcpSocket, serverWS, vlessRespHeader, null);
+          } catch (directError) {
+            console.error('直接连接失败:', directError.message);
+            serverWS.close(1011, '所有连接方式都失败');
+          }
+        }
+      } catch (generalError) {
+        console.error('连接过程中出现意外错误:', generalError);
+        serverWS.close(1011, `连接失败: ${generalError.message}`);
+      }
+    },
+    close() {
+      if (remoteSocket) {
+        closeSocket(remoteSocket);
+      }
+    }
+  })).catch(err => {
+    console.error('WebSocket 错误:', err);
+    closeSocket(remoteSocket);
+    serverWS.close(1011, '内部错误');
+  });
+
+  return new Response(null, {
+    status: 101,
+    webSocket: clientWS,
+  });
+}
+
+async function connectViaSocks5(targetHost, targetPort, rawClientData) {
+  const socks5Socket = await connect({
+    hostname: RUNTIME_CONFIG.socks5.host,
+    port: RUNTIME_CONFIG.socks5.port
+  });
+
+  const writer = socks5Socket.writable.getWriter();
+  const reader = socks5Socket.readable.getReader();
+
+  try {
+    // 判断是否需要认证
+    const needAuth = RUNTIME_CONFIG.socks5.username && RUNTIME_CONFIG.socks5.password;
+    
+    // 发送认证方法
+    const authMethods = needAuth ? 
+      new Uint8Array([0x05, 0x01, 0x02]) :  // 支持用户名密码认证
+      new Uint8Array([0x05, 0x01, 0x00]);   // 无需认证
+    
+    await writer.write(authMethods);
+    const authResponse = await reader.read();
+    const authData = new Uint8Array(authResponse.value);
+    
+    if (authData[0] !== 0x05) {
+      throw new Error('SOCKS5版本协商失败');
+    }
+
+    // 如果需要认证
+    if (needAuth) {
+      if (authData[1] !== 0x02) {
+        throw new Error('SOCKS5服务器不支持用户名密码认证');
+      }
+      
+      const username = new TextEncoder().encode(RUNTIME_CONFIG.socks5.username);
+      const password = new TextEncoder().encode(RUNTIME_CONFIG.socks5.password);
+      const authPacket = new Uint8Array(3 + username.length + password.length);
+      
+      authPacket[0] = 0x01;
+      authPacket[1] = username.length;
+      authPacket.set(username, 2);
+      authPacket[2 + username.length] = password.length;
+      authPacket.set(password, 3 + username.length);
+      
+      await writer.write(authPacket);
+      const authResult = await reader.read();
+      const authResultData = new Uint8Array(authResult.value);
+      
+      if (authResultData.length < 2 || authResultData[1] !== 0x00) {
+        throw new Error('SOCKS5用户名密码认证失败');
+      }
+    } else if (authData[1] !== 0x00) {
+      throw new Error('SOCKS5服务器要求认证，但未提供认证信息');
+    }
+
+    // 发送连接请求
+    const hostBytes = new TextEncoder().encode(targetHost);
+    const connectPacket = new Uint8Array(7 + hostBytes.length);
+    
+    connectPacket[0] = 0x05;  // SOCKS版本
+    connectPacket[1] = 0x01;  // CONNECT命令
+    connectPacket[2] = 0x00;  // 保留字段
+    connectPacket[3] = 0x03;  // 域名类型
+    connectPacket[4] = hostBytes.length;
+    connectPacket.set(hostBytes, 5);
+    connectPacket[5 + hostBytes.length] = (targetPort >> 8) & 0xFF;
+    connectPacket[6 + hostBytes.length] = targetPort & 0xFF;
+    
+    await writer.write(connectPacket);
+    const connectResponse = await reader.read();
+    const connectData = new Uint8Array(connectResponse.value);
+    
+    if (connectData.length < 2 || connectData[1] !== 0x00) {
+      throw new Error(`SOCKS5连接失败，错误码: ${connectData[1]}`);
+    }
+
+    reader.releaseLock();
+    writer.releaseLock();
+
+    const dataWriter = socks5Socket.writable.getWriter();
+    await dataWriter.write(rawClientData);
+    dataWriter.releaseLock();
+
+    return socks5Socket;
+  } catch (err) {
+    try {
+      reader.releaseLock();
+      writer.releaseLock();
+    } catch (e) {}
+    closeSocket(socks5Socket);
+    throw err;
+  }
+}
+
+async function tryNAT64Connect(domain, port, rawClientData) {
+  let lastError = null;
+  
+  for (let attempt = 0; attempt < RUNTIME_CONFIG.nat64Servers.length; attempt++) {
+    const nat64Server = nat64Manager.getNextServer();
+    
+    try {
+      const proxyIP = await getIPv6ProxyAddress(domain, nat64Server);
+      const connectPromise = connect({ hostname: proxyIP, port: port });
+      const timeoutPromise = new Promise((_, reject) => {
+        setTimeout(() => reject(new Error('连接超时')), nat64Server.timeout);
+      });
+      
+      const tcpSocket = await Promise.race([connectPromise, timeoutPromise]);
+      nat64Manager.markServerHealthy(nat64Server.index);
+      
+      const writer = tcpSocket.writable.getWriter();
+      await writer.write(rawClientData);
+      writer.releaseLock();
+      
+      return tcpSocket;
+    } catch (err) {
+      lastError = err;
+      nat64Manager.markServerUnhealthy(nat64Server.index);
+      
+      if (attempt < RUNTIME_CONFIG.nat64Servers.length - 1) {
+        continue;
+      }
+    }
+  }
+  
+  throw new Error(`所有NAT64服务器连接失败，最后错误: ${lastError?.message}`);
+}
+
+async function directConnect(address, port, rawClientData) {
+  const tcpSocket = await connect({ hostname: address, port: port });
+  const writer = tcpSocket.writable.getWriter();
+  await writer.write(rawClientData);
+  writer.releaseLock();
+  return tcpSocket;
+}
+
+async function getIPv6ProxyAddress(domain, nat64Server) {
+  const dnsQuery = await fetch(`${RUNTIME_CONFIG.dnsServer}?name=${domain}&type=A`, {
+    headers: { 'Accept': 'application/dns-json' }
+  });
+  
+  const dnsResult = await dnsQuery.json();
+  if (dnsResult.Answer && dnsResult.Answer.length > 0) {
+    const aRecord = dnsResult.Answer.find(record => record.type === 1);
+    if (aRecord) {
+      const ipv4Address = aRecord.data;
+      return convertToNAT64IPv6(ipv4Address, nat64Server.prefix);
+    }
+  }
+  throw new Error('无法解析域名的IPv4地址');
+}
+
+function convertToNAT64IPv6(ipv4Address, nat64Prefix) {
+  const parts = ipv4Address.split('.');
+  if (parts.length !== 4) throw new Error('无效的IPv4地址');
+  
+  const hex = parts.map(part => {
+    const num = parseInt(part, 10);
+    if (num < 0 || num > 255) throw new Error('无效的IPv4地址段');
+    return num.toString(16).padStart(2, '0');
+  });
+  
+  if (nat64Prefix === '64:ff9b') {
+    return `[64:ff9b::${hex[0]}${hex[1]}:${hex[2]}${hex[3]}]`;
+  } else if (nat64Prefix.includes('::')) {
+    return `[${nat64Prefix}:${hex[0]}${hex[1]}:${hex[2]}${hex[3]}]`;
+  } else {
+    return `[${nat64Prefix}::${hex[0]}${hex[1]}:${hex[2]}${hex[3]}]`;
+  }
+}
+
+function createWebSocketReadableStream(ws, earlyDataHeader) {
+  return new ReadableStream({
+    start(controller) {
+      ws.addEventListener('message', event => {
+        controller.enqueue(event.data);
+      });
+      
+      ws.addEventListener('close', () => {
+        controller.close();
+      });
+      
+      ws.addEventListener('error', err => {
+        controller.error(err);
+      });
+      
+      if (earlyDataHeader) {
+        try {
+          const decoded = atob(earlyDataHeader.replace(/-/g, '+').replace(/_/g, '/'));
+          const data = Uint8Array.from(decoded, c => c.charCodeAt(0));
+          controller.enqueue(data.buffer);
+        } catch (e) {}
+      }
+    }
+  });
+}
+
+function parseVLESSHeader(buffer, userID) {
+  if (buffer.byteLength < 24) {
+    return { hasError: true, message: '无效的头部长度' };
+  }
+  
+  const view = new DataView(buffer);
+  const version = new Uint8Array(buffer.slice(0, 1));
+  
+  const uuid = formatUUID(new Uint8Array(buffer.slice(1, 17)));
+  if (uuid !== userID) {
+    return { hasError: true, message: '无效的用户' };
+  }
+  
+  const optionsLength = view.getUint8(17);
+  const command = view.getUint8(18 + optionsLength);
+  
+  let isUDP = false;
+  if (command === 1) {
+  } else if (command === 2) {
+    isUDP = true;
+  } else {
+    return { hasError: true, message: '不支持的命令，仅支持TCP(01)和UDP(02)' };
+  }
+  
+  let offset = 19 + optionsLength;
+  const port = view.getUint16(offset);
+  offset += 2;
+  
+  const addressType = view.getUint8(offset++);
+  let address = '';
+  
+  switch (addressType) {
+    case 1:
+      address = Array.from(new Uint8Array(buffer.slice(offset, offset + 4))).join('.');
+      offset += 4;
+      break;
+      
+    case 2:
+      const domainLength = view.getUint8(offset++);
+      address = new TextDecoder().decode(buffer.slice(offset, offset + domainLength));
+      offset += domainLength;
+      break;
+      
+    case 3:
+      const ipv6 = [];
+      for (let i = 0; i < 8; i++) {
+        ipv6.push(view.getUint16(offset).toString(16).padStart(4, '0'));
+        offset += 2;
+      }
+      address = ipv6.join(':').replace(/(^|:)0+(\w)/g, '$1$2');
+      break;
+      
+    default:
+      return { hasError: true, message: '不支持的地址类型' };
+  }
+  
+  return {
+    hasError: false,
+    addressRemote: address,
+    portRemote: port,
+    rawDataIndex: offset,
+    vlessVersion: version,
+    isUDP
+  };
+}
+
+function pipeRemoteToWebSocket(remoteSocket, ws, vlessHeader, retry = null) {
+  let headerSent = false;
+  let hasIncomingData = false;
+  
+  remoteSocket.readable.pipeTo(new WritableStream({
+    write(chunk) {
+      hasIncomingData = true;
+      if (ws.readyState === WS_READY_STATE_OPEN) {
+        if (!headerSent) {
+          const combined = new Uint8Array(vlessHeader.byteLength + chunk.byteLength);
+          combined.set(new Uint8Array(vlessHeader), 0);
+          combined.set(new Uint8Array(chunk), vlessHeader.byteLength);
+          ws.send(combined.buffer);
+          headerSent = true;
+        } else {
+          ws.send(chunk);
+        }
+      }
+    },
+    close() {
+      if (!hasIncomingData && retry) {
+        retry();
+        return;
+      }
+      if (ws.readyState === WS_READY_STATE_OPEN) {
+        ws.close(1000, '正常关闭');
+      }
+    },
+    abort() {
+      closeSocket(remoteSocket);
+    }
+  })).catch(err => {
+    console.error('数据转发错误:', err);
+    closeSocket(remoteSocket);
+    if (ws.readyState === WS_READY_STATE_OPEN) {
+      ws.close(1011, '数据传输错误');
+    }
+  });
+}
+
+function closeSocket(socket) {
+  if (socket) {
+    try {
+      socket.close();
+    } catch (e) {}
+  }
+}
+
+function formatUUID(bytes) {
+  const hex = Array.from(bytes, b => b.toString(16).padStart(2, '0')).join('');
+  return `${hex.slice(0,8)}-${hex.slice(8,12)}-${hex.slice(12,16)}-${hex.slice(16,20)}-${hex.slice(20)}`;
+}
+
+async function handleUDPOutBound(webSocket, vlessResponseHeader) {
+  let isVlessHeaderSent = false;
+  const transformStream = new TransformStream({
+    start(controller) {},
+    transform(chunk, controller) {
+      for (let index = 0; index < chunk.byteLength;) {
+        const lengthBuffer = chunk.slice(index, index + 2);
+        const udpPacketLength = new DataView(lengthBuffer).getUint16(0);
+        const udpData = new Uint8Array(
+          chunk.slice(index + 2, index + 2 + udpPacketLength)
+        );
+        index = index + 2 + udpPacketLength;
+        controller.enqueue(udpData);
+      }
+    },
+    flush(controller) {}
+  });
+
+  transformStream.readable.pipeTo(new WritableStream({
+    async write(chunk) {
+      const resp = await fetch(RUNTIME_CONFIG.dnsServer, {
+        method: 'POST',
+        headers: { 'content-type': 'application/dns-message' },
+        body: chunk,
+      });
+      const dnsQueryResult = await resp.arrayBuffer();
+      const udpSize = dnsQueryResult.byteLength;
+      const udpSizeBuffer = new Uint8Array([(udpSize >> 8) & 0xff, udpSize & 0xff]);
+      
+      if (webSocket.readyState === WS_READY_STATE_OPEN) {
+        if (isVlessHeaderSent) {
+          webSocket.send(await new Blob([udpSizeBuffer, dnsQueryResult]).arrayBuffer());
+        } else {
+          webSocket.send(await new Blob([vlessResponseHeader, udpSizeBuffer, dnsQueryResult]).arrayBuffer());
+          isVlessHeaderSent = true;
+        }
+      }
+    }
+  })).catch((error) => {
+    console.error('DNS UDP处理错误:', error);
+  });
+
+  const writer = transformStream.writable.getWriter();
+
+  return {
+    write(chunk) {
+      writer.write(chunk);
+    }
+  };
+}
