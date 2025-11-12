@@ -1,0 +1,167 @@
+const http = require('http');
+const https = require('https');
+const url = require('url');
+
+// 全局变量存储订阅内容
+let subscription_content = '';
+let last_fetch_date = null;
+
+// 获取当前格式化的日期
+function getFormattedDate() {
+    const now = new Date();
+    const year = now.getFullYear();
+    const month = String(now.getMonth() + 1).padStart(2, '0');
+    const day = String(now.getDate()).padStart(2, '0');
+    return { year, month, day };
+}
+
+// 处理节点内容，去除指定的文本
+function processNodeContent(content) {
+    try {
+        // 解码 base64
+        const decoded = Buffer.from(content, 'base64').toString('utf-8');
+        
+        // 按行分割节点
+        const lines = decoded.split('\n');
+        
+        // 处理每一行，去除节点名称中的指定文本
+        const processedLines = lines.map(line => {
+            if (!line.trim()) return line;
+            
+            // 处理不同协议的节点格式
+            // vmess://, vless://, trojan://, ss:// 等
+            if (line.includes('://')) {
+                try {
+                    const [protocol, rest] = line.split('://');
+                    
+                    // 对于 vmess 协议（base64 编码的 JSON）
+                    if (protocol === 'vmess') {
+                        const vmessDecoded = Buffer.from(rest, 'base64').toString('utf-8');
+                        const vmessObj = JSON.parse(vmessDecoded);
+                        
+                        // 去除节点名称中的指定文本
+                        if (vmessObj.ps) {
+                            vmessObj.ps = vmessObj.ps
+                                .replace(/\(mibei77\.com\s*米贝节点分享\)/gi, '')
+                                .replace(/mibei77\.com\s*米贝节点分享/gi, '')
+                                .trim();
+                        }
+                        
+                        const newVmess = Buffer.from(JSON.stringify(vmessObj)).toString('base64');
+                        return `${protocol}://${newVmess}`;
+                    }
+                    
+                    // 对于其他协议（URL 格式）
+                    // 例如: trojan://password@server:port?...#节点名称
+                    if (line.includes('#')) {
+                        const parts = line.split('#');
+                        const nodeName = decodeURIComponent(parts[parts.length - 1]);
+                        const cleanedName = nodeName
+                            .replace(/\(mibei77\.com\s*米贝节点分享\)/gi, '')
+                            .replace(/mibei77\.com\s*米贝节点分享/gi, '')
+                            .trim();
+                        parts[parts.length - 1] = encodeURIComponent(cleanedName);
+                        return parts.join('#');
+                    }
+                } catch (e) {
+                    console.error('处理节点时出错:', e.message);
+                    return line;
+                }
+            }
+            
+            return line;
+        });
+        
+        // 重新编码为 base64
+        const processed = processedLines.join('\n');
+        return Buffer.from(processed).toString('base64');
+        
+    } catch (error) {
+        console.error('处理内容时出错:', error.message);
+        return content; // 出错时返回原内容
+    }
+}
+
+// 抓取订阅内容
+function fetchSubscriptionContent() {
+    const { year, month, day } = getFormattedDate();
+    const targetUrl = `https://node.freeclashnode.com/uploads/${year}/${month}/1-${year}${month}${day}.txt`;
+    
+    console.log(`正在抓取: ${targetUrl}`);
+    
+    return new Promise((resolve, reject) => {
+        https.get(targetUrl, (response) => {
+            let data = '';
+            
+            response.on('data', (chunk) => {
+                data += chunk;
+            });
+            
+            response.on('end', () => {
+                if (response.statusCode === 200) {
+                    // 处理内容，去除节点名称中的指定文本
+                    const processedContent = processNodeContent(data);
+                    subscription_content = processedContent;
+                    last_fetch_date = new Date().toDateString();
+                    console.log('内容抓取成功并已处理');
+                    resolve(processedContent);
+                } else {
+                    reject(new Error(`HTTP错误: ${response.statusCode}`));
+                }
+            });
+        }).on('error', (err) => {
+            console.error('抓取错误:', err.message);
+            reject(err);
+        });
+    });
+}
+
+// 创建HTTP服务器
+const server = http.createServer(async (req, res) => {
+    const parsedUrl = url.parse(req.url, true);
+    
+    // 设置CORS头
+    res.setHeader('Access-Control-Allow-Origin', '*');
+    res.setHeader('Access-Control-Allow-Methods', 'GET');
+    
+    if (parsedUrl.pathname === '/subscription') {
+        try {
+            const today = new Date().toDateString();
+            
+            // 如果今天还没有抓取过内容，或者内容为空，则进行抓取
+            if (last_fetch_date !== today || !subscription_content) {
+                console.log('开始抓取今日内容...');
+                const content = await fetchSubscriptionContent();
+                res.writeHead(200, { 'Content-Type': 'text/plain; charset=utf-8' });
+                res.end(content);
+            } else {
+                console.log('返回已缓存的内容');
+                res.writeHead(200, { 'Content-Type': 'text/plain; charset=utf-8' });
+                res.end(subscription_content);
+            }
+        } catch (error) {
+            console.error('处理请求时出错:', error.message);
+            res.writeHead(500, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ error: '无法获取订阅内容' }));
+        }
+    } else {
+        res.writeHead(404, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: '端点未找到，请访问 /subscription' }));
+    }
+});
+
+// 启动服务器
+const PORT = 3000;
+server.listen(PORT, () => {
+    console.log(`服务器运行在 http://localhost:${PORT}`);
+    console.log('访问 /subscription 获取内容');
+});
+
+// 优雅关闭
+process.on('SIGINT', () => {
+    console.log('\n正在关闭服务器...');
+    server.close(() => {
+        console.log('服务器已关闭');
+        process.exit(0);
+    });
+});
